@@ -339,6 +339,8 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         self.groups_padding = []
         # loop to deal with groups
         for i, param_group in enumerate(self.optimizer.param_groups):
+            # partition_id
+            # TODO(???) : real_dp_process_group vs dp_process_group
             partition_id = dist.get_rank(group=self.real_dp_process_group[i])
 
             # push this group to list before modify
@@ -349,7 +351,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                     param.grad_accum = None
                     param.param_idx_in_group = len(trainable_parameters)
                     trainable_parameters.append(param)
-            self.bit16_groups.append(trainable_parameters)
+            self.bit16_groups.append(trainable_parameters)      # bit16_groups是原始的可训练参数
 
             # not sure why apex was cloning the weights before flattening
             # removing cloning here
@@ -358,6 +360,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
             # move all the parameters to cpu to free up GPU space for creating flat buffer
 
             # Create temp CPU param copies, free accelerator tensors
+            # 对所有参数拷贝到cpu中，并记录到cpu_data中。param.data置为空tensor。orig_group_numel记录原始长度。
             orig_group_numel = 0
             for param in self.bit16_groups[i]:
                 orig_group_numel += param.numel()
@@ -385,6 +388,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
             meta_tensors = []
             for param in round_robin_tensors:
                 meta_tensors.append(torch.zeros_like(param.cpu_data, device="meta"))
+            # round_robin_bit16_meta会记录模型参数的形状
             self.round_robin_bit16_meta.append(meta_tensors)
 
             # create flat buffer in CPU
@@ -398,6 +402,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                 del param.cpu_data
 
             # Move CPU flat tensor to the accelerator memory.
+            # 前面flatten_dense_tensors_aligned会将tensor在cpu上flatten为一维的tensor, 记录与bit16_groups_flat
             self.bit16_groups_flat.append(flattened_buffer.to(get_accelerator().current_device_name()))
             del flattened_buffer
 
@@ -407,11 +412,17 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                 see_memory_usage(f"After Flattening and after emptying param group {i} cache", force=False)
 
             # set model bit16 weight to slices of flattened buffer
+            # 将一维的tensor列表重新unflatten为原始形状，并设置会round_robin_bit16_groups。
+            # 这意味着round_robin_bit16_groups的底层存储也是平铺的一维tensor。
+            # 实际上bit16_groups_flat和round_robin_bit16_groups只是表达形式不同，底层是同一块内存。
+            # 使用round_robin_bit16_groups可以方便地根据原始形状访问参数。
             self._update_model_bit16_weights(i)
 
             # divide the flat weights into near equal partition equal to the data parallel degree
             # each process will compute on a different part of the partition
+            # 将模型按照分区的个数切分为多个部分，每个进程处理其中一部分
             data_parallel_partitions = self.get_data_parallel_partitions(self.bit16_groups_flat[i], i)
+            # parallel_partitioned_bit16_groups就记录了分区后的模型参数。
             self.parallel_partitioned_bit16_groups.append(data_parallel_partitions)
 
             # Record padding required for alignment
@@ -430,9 +441,11 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
             for partitioned_data in data_parallel_partitions:
                 assert (partitioned_data.data_ptr() % (2 * self.nccl_start_alignment_factor) == 0)
 
+            # 接下来处理有呼气参数
             # A partition of the fp32 master weights that will be updated by this process.
             # Note that the params in single_partition_of_fp32_groups is cloned and detached
             # from the origin params of the model.
+            # 将模型参数拷贝到新的区域single_partition_of_fp32_groups，用于优化器参数。
             if not fp16_master_weights_and_gradients:
                 weights_partition = self.parallel_partitioned_bit16_groups[i][partition_id].to(
                     self.device).clone().float().detach()
@@ -453,6 +466,8 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                 else:
                     self.param_buffer_of_bit16_for_cpu_offload_groups.append(temp_buffer_bit16)
 
+            # single_partition_of_fp32_groups是从原始模型参数的拷贝的，用于参数更新?????
+            # 其中其grad属性记录反向计算的梯度。
             self.single_partition_of_fp32_groups.append(weights_partition)
 
             # Set local optimizer to have flat params of its own partition.
@@ -463,6 +478,10 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
             param_group['params'] = [self.single_partition_of_fp32_groups[i]]
 
             partition_size = len(self.bit16_groups_flat[i]) / dist.get_world_size(group=self.real_dp_process_group[i])
+            # 返回的值, 分别表示:
+            # 1 params_in_partition: 在当前分区的参数
+            # 2 params_not_in_partition: 不在当前分区的参数。
+            # 3 first_offset: 如果tensor在两个分区之间的情况，tensor分区间切分的offset
             params_in_partition, params_not_in_partition, first_offset = self.get_partition_info(
                 self.round_robin_bit16_groups[i], partition_size, partition_id)
 
@@ -581,6 +600,8 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         # 3. overlapping backward and reduction
         self._grad_acc_hooks = []
 
+        # create_gradient_handling_hooks会对每个可训练参数注册hook, 执行process_gradients。
+        # 对于stage2, 则会执行reduce_ready_partitions_and_remove_grads。
         if (self.partition_gradients or self.overlap_comm or self.use_grad_accum_attribute
                 or self.contiguous_gradients):
             self.create_gradient_handling_hooks()
@@ -753,6 +774,8 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
 
     def initialize_optimizer_states(self):
 
+        # self.partition_size记录了每个模型参数分区的大小
+        # 给single_partition_of_fp32_groups的grad属性设置创造空间，等待更新。
         for i, group in enumerate(self.bit16_groups):
             single_grad_partition = torch.zeros(int(self.partition_size[i]),
                                                 dtype=self.single_partition_of_fp32_groups[i].dtype,
@@ -766,6 +789,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         if isinstance(self.optimizer, torch.optim.Adagrad):
             self.optimizer = torch.optim.Adagrad(self.single_partition_of_fp32_groups, **self.optimizer.defaults)
 
+        # TODO(???):
         if not self.cpu_offload:
             for group in self.single_partition_of_fp32_groups:
                 group.grad = None  #class init
@@ -1721,6 +1745,8 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
     def get_data_parallel_partitions(self, tensor, group_id):
         partitions = []
 
+        # TODO(???): real_dp_process_group vs real_dp_process_group
+        # 使用的是real_dp_process_group来切分模型的tensor
         dp = dist.get_world_size(group=self.real_dp_process_group[group_id])
         # dp_id = dist.get_rank(group=self.real_dp_process_group[group_id])
 
@@ -1972,6 +1998,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
 
     def _optimizer_step(self, group_no):
         original_param_groups = self.optimizer.param_groups
+        # 这里会重置optimizer的param_groups, 即当前只更新当前分区的优化器参数。
         self.optimizer.param_groups = [original_param_groups[group_no]]
         # Disabling this as the C++ side copy & synchronize is not working correctly
         #from deepspeed.ops.adam import DeepSpeedCPUAdam
@@ -2310,11 +2337,15 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
     # This method assumes that each param group contains a single flattened tensor.
     def _get_base_optimizer_state(self):
         optimizer_groups_state = []
+        # 对于fused adam, param_groups[0] keys: ['params', 'lr', 'bias_correction', 'betas', 'eps', 'weight_decay', 'step']
+        #
         for i, group in enumerate(self.optimizer.param_groups):
-            p = group['params'][0]
+            p = group['params'][0]      # group['params']只有一个值，即当前分区的flattened tensor
+            # self.optimizer.state[p]的值是一个字典，记录了step, exp_avg, exp_avg_sq等优化器参数，本例为FusedAdam。
             lean_optimizer_state = self._get_state_without_padding(self.optimizer.state[p], self.groups_padding[i])
             optimizer_groups_state.append(lean_optimizer_state)
 
+        # 对于self.optimizer.state[p]，返回的是step, exp_avg, exp_avg_sq等优化器参数，本例为FusedAdam。
         return optimizer_groups_state
 
     def state_dict(self):
@@ -2335,6 +2366,8 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         state_dict[CLIP_GRAD] = self.clip_grad
 
         if self.elastic_checkpoint:
+            # 如果是elastic checkpoint, 对于fused adam, 返回的dict为:
+            # 对于self.optimizer.state[p]，返回的是step, exp_avg, exp_avg_sq等优化器参数。即state中的信息。
             state_dict[BASE_OPTIMIZER_STATE] = self._get_base_optimizer_state()
 
             if "step" in self.optimizer.param_groups[0]:
@@ -2343,6 +2376,10 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                            for group in self.optimizer.param_groups), "All param groups must have the same step value"
                 state_dict[BASE_OPTIMIZER_STATE_STEP] = self.optimizer.param_groups[0]["step"]
         else:
+            # 如果是非elastic checkpoint，直接调用optimizer的state_dict.
+            # 即对于fused adam, 返回的dict为:
+            #  {'param_groups': [{'betas': [0.8, 0.999], 'bias_correction': True, 'eps': 1e-08, 'lr': 0.00044073976491130644, 'params': [0], 'step': 0, 'weight_decay': 3e-07}],
+            #  'state': {0: {'exp_avg': tensor([...], device='cuda:0'), 'exp_avg_sq': tensor([...], device='cuda:0'), 'step': 21}}}
             state_dict[BASE_OPTIMIZER_STATE] = self.optimizer.state_dict()
 
         # Remove paddings for DP alignment to enable loading for other alignment values
@@ -2528,7 +2565,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         """
 
         # I think it should actually be ok to reload the optimizer before the model.
-        dp_rank = dist.get_rank(group=self.dp_process_group)
+        dp_rank = dist.get_rank(group=self.dp_process_group)        # dp_rank
         current_rank_sd = state_dict_list[dp_rank]
         self._load_global_state(current_rank_sd)
 

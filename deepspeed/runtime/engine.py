@@ -1134,6 +1134,10 @@ class DeepSpeedEngine(Module):
         rank = self.local_rank if self.use_node_local_storage() else dp_rank
 
         # Determine if this data parallel process needs to store the model checkpoint
+        # save_non_zero_checkpoint是开启保存模型参数的标志,以下两种条件只要有一个成立即可:
+        # (1) global_rank为0的情况。
+        # (2) 对于zero3, 如果没有mics_shard_size则返回True, 默认所有节点都会保存模型参数，尽管模型参数对于zero3来说意义不大。
+        #     注: 如果mics_shard_size大于0，则是另外的情况，暂不分析。
         if self.checkpoint_engine.is_data_parallel_writer(rank) \
             or (self.zero_optimization_partition_weights() and self.is_first_weights_partition_group()):
             self.save_non_zero_checkpoint = True
@@ -3685,6 +3689,7 @@ class DeepSpeedEngine(Module):
         state.update(client_state)
         log_dist(message=f'Saving model checkpoint: {save_path}', ranks=[0])
 
+        # save_non_zero_checkpoint: 是否保存模型的标志
         if self.save_non_zero_checkpoint:
             self.checkpoint_engine.save(state_dict=state, path=save_path)
 
