@@ -636,6 +636,9 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         self._hp_optimizer_states_linked = False
 
         self._enable_universal_checkpoint()
+        # _link_all_hp_params为每个参数生成_hp_mapping。
+        # _create_param_mapping调用每个参数的_hp_mapping，并生成低精度模型参数到高精度模型分区参数的映射。
+        # 主要用于universal checkpoint。
         self._param_slice_mappings = self._create_param_mapping()
         if self.cpu_offload:
             self._create_optimizer_mapping()

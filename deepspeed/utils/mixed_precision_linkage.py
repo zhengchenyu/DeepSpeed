@@ -10,6 +10,17 @@ from deepspeed.utils import set_full_hp_param, set_full_hp_grad
 
 def link_hp_params(lp_param_list, flat_hp_partition, gradient_dict, offload_gradient_dict, use_offload,
                    param_group_index, partition_start, partition_size, dp_group):
+    # stage_1_and_2.py中传入参数说明:
+    # lp_param_list: self.bit16_groups[i] 即用于前向计算的低精度模型参数
+    # flat_hp_partition: self.single_partition_of_fp32_groups[i] 用于更新更新的高精度模型分区参数
+    # gradient_dict: self.averaged_gradients
+    # offload_gradient_dict: self.offload_gradient_dict
+    # use_offload: self.cpu_offload
+    # param_group_index: i
+    # partition_start: partition_id * partition_size, 分区起始位置，
+    # partition_size: partition_size, 平均划分的分区大小
+    # dp_group: self.real_dp_process_group[i]
+
     local_lp_param_and_offset = _init_lp_to_hp_mapping(lp_param_list, partition_start, partition_size, dp_group)
 
     for lp_param, lp_start in local_lp_param_and_offset:

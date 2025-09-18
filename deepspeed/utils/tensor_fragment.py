@@ -372,22 +372,32 @@ def safe_update_full_grad_vectorized(param_list: List[torch.nn.Parameter], updat
 
 def get_hp_fragment_mapping(lp_param, lp_start, flat_hp_partition, gradient_dict, offload_gradient_dict, use_offload,
                             param_group_index, partition_start, partition_size):
+    # lp_start和lp_end是参数在整体参数的索引。
+    # hp_start和hp_end是按照分区平均划分大小的索引。
+    # _init_lp_to_hp_mapping计算在hp_start和hp_end分区内的参数的时候，是有可能超过分区的。
+    # 因此lp_start<=hp_start, lp_end>=hp_end的情况是有可能出现的。
     lp_end = lp_param.numel() + lp_start
-    hp_start = partition_start
-    hp_end = partition_start + partition_size
+    hp_start = partition_start                      # 平均划分分区的起始位置
+    hp_end = partition_start + partition_size       # 平均划分分区的结束位置
 
+    # 因为参数的offset可能越界，所以需要限制hp_start和hp_end做限制。
+    # 对于完全在分区内的参数，fragment_start和fragment_end即参数的起始和结束位置。
+    # 对于与边界有重叠的参数，fragment_start和fragment_end通过分区的起始和结束位置做限制。接下来lp_fragment_tensor也限制这个分区只更新这个参数的部分内容
     fragment_start = max(lp_start, hp_start)
     fragment_end = min(lp_end, hp_end)
     assert fragment_start < fragment_end, \
         f'fragment start {fragment_start} should be < fragment_end {fragment_end}'
 
+    # 当前参数在高精度模型分区参数中的offset和长度
     fragment_numel = fragment_end - fragment_start
-    hp_frag_address = fragment_address(start=fragment_start - hp_start, numel=fragment_numel)
-    hp_fragment_tensor = flat_hp_partition.narrow(0, hp_frag_address.start, hp_frag_address.numel)
+    hp_frag_address = fragment_address(start=fragment_start - hp_start, numel=fragment_numel)       # [0 - partition_size]
+    hp_fragment_tensor = flat_hp_partition.narrow(0, hp_frag_address.start, hp_frag_address.numel)  # 高精度模型分区参数对应的tensor
 
+    # 当前参数在低精度模型参数中的offset和长度。这里值得注意的是。这个长度可能小于参数的实际长度。这里只映射属于该分区的部分。
     lp_frag_address = fragment_address(start=fragment_start - lp_start, numel=fragment_numel)
     lp_fragment_tensor = lp_param.flatten().narrow(0, lp_frag_address.start, lp_frag_address.numel)
 
+    # 返回低精度模型参数lp和高精度模型分区参数fp的映射关系
     return tensor_fragment(lp_fragment=lp_fragment_tensor,
                            lp_fragment_address=lp_frag_address,
                            hp_fragment=hp_fragment_tensor,
