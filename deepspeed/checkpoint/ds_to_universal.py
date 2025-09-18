@@ -152,11 +152,30 @@ def extract_zero_shards(dir, ds_checkpoint, indices_3D):
 def extract_zero_shards_stage3(optim_files, param_shapes, dp_degree, temp_dir, dp_index):
     state_dict = torch.load(optim_files[dp_index], map_location='cpu', weights_only=False)
 
-    flat_state = dict(
-        exp_avg=state_dict[OPTIMIZER_STATE_DICT]['optimizer_state_dict']['state'][0]["exp_avg"],
-        exp_avg_sq=state_dict[OPTIMIZER_STATE_DICT]['optimizer_state_dict']['state'][0]["exp_avg_sq"],
-        fp32=state_dict[OPTIMIZER_STATE_DICT]['fp32_flat_groups'][0],
-    )
+    flat_state = {}
+    for key in ['exp_avg', 'exp_avg_sq']:
+        tmp = None
+        for _, sd in state_dict[OPTIMIZER_STATE_DICT]['optimizer_state_dict']['state'].items():
+            if tmp is None:
+                tmp = sd[key]
+            else:
+                tmp = torch.cat((tmp, sd[key]))
+        flat_state[key] = tmp
+
+    tmp = None
+    for tensor in state_dict[OPTIMIZER_STATE_DICT]['fp32_flat_groups']:
+        if tmp is None:
+            tmp = tensor
+        else:
+            tmp = torch.cat((tmp, tensor))
+    flat_state["fp32"] = tmp
+
+
+    # flat_state = dict(
+    #     exp_avg=state_dict[OPTIMIZER_STATE_DICT]['optimizer_state_dict']['state'][0]["exp_avg"],
+    #     exp_avg_sq=state_dict[OPTIMIZER_STATE_DICT]['optimizer_state_dict']['state'][0]["exp_avg_sq"],
+    #     fp32=state_dict[OPTIMIZER_STATE_DICT]['fp32_flat_groups'][0],
+    # )
 
     offset = 0
     for name, shape in param_shapes.items():
@@ -515,7 +534,7 @@ def main(args):
         model_files = _get_model_state_files(args.input_folder)
         param_shapes = _parse_model_states_stage3(model_files)
         param_shapes = {k: v for d in param_shapes for k, v in d.items()}
-        dp_degree = len(model_files)
+        dp_degree = len(optim_files)
 
         temp_dir = os.path.join(args.output_folder, 'tmp')
 
