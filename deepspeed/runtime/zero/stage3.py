@@ -461,6 +461,8 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
 
         self.offloaded_states: Set[OffloadDeviceEnum] = set()
 
+        self._all_reduce_hook: Optional[Callable[[torch.Tensor], None]] = None
+
         if dist.get_rank(group=self.dp_process_group) == 0:
             see_memory_usage("After initializing ZeRO optimizer", force=True)
 
@@ -1356,6 +1358,8 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
     @instrument_w_nvtx
     def __avg_scatter_contiguous_grads(self, buffer_to_reduce: Tensor,
                                        communication_data_type: torch.dtype) -> List[Tensor]:
+        # 该函数做allreduce的时候是完整的tensor,
+        # allreduce之后会切分，值保留自己的那一部分。
         dtype = buffer_to_reduce.dtype
         if communication_data_type != dtype:
             buffer_to_reduce = buffer_to_reduce.to(communication_data_type)
@@ -1373,6 +1377,10 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
 
         if communication_data_type != self.dtype:
             buffer_to_reduce = buffer_to_reduce.to(self.dtype)
+
+        # TODO: Hook here
+        if self._all_reduce_hook:
+            self._all_reduce_hook(buffer_to_reduce)
 
         grad_partitions = []
         grad_offset_in_buffer = 0
@@ -1424,6 +1432,11 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
 
         if communication_data_type != self.dtype:
             grad_partitions_for_rank = [g.to(self.dtype) for g in grad_partitions_for_rank]
+
+        # Add hook
+        if self._all_reduce_hook:
+            for g in grad_partitions_for_rank:
+                self._all_reduce_hook(g)
 
         return grad_partitions_for_rank
 
@@ -2959,6 +2972,9 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
         self._partition_all_parameters()
 
     def checkpoint_event_epilogue(self):
+        # In general, we partition all parameters to ds_secondary_tensor before checkpointing.
+        # But after loading checkpoint, only ds_tensor is updated, so ds_secondary_tensor is dirty.
+        self.invalidate_secondary_tensor()
         if len(self.persistent_parameters) > 0:
             self.persistent_parameters[0].all_gather(self.persistent_parameters)
 

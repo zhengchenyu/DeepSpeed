@@ -8,7 +8,7 @@ from deepspeed import comm as dist
 from packaging import version as pkg_version
 from collections import OrderedDict, defaultdict
 from dataclasses import dataclass, field
-from typing import List, Dict, Set
+from typing import List, Dict, Set, Optional, Callable
 
 from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 from deepspeed.runtime.zenflow import zenflow_utils
@@ -351,7 +351,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                     param.grad_accum = None
                     param.param_idx_in_group = len(trainable_parameters)
                     trainable_parameters.append(param)
-            self.bit16_groups.append(trainable_parameters)      # bit16_groups是原始的可训练参数
+            self.bit16_groups.append(trainable_parameters)  # bit16_groups是原始的可训练参数
 
             # not sure why apex was cloning the weights before flattening
             # removing cloning here
@@ -644,6 +644,8 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
             self._create_optimizer_mapping()
 
         self.offloaded_states: Set[OffloadStateTypeEnum] = set()
+
+        self._all_reduce_hook: Optional[Callable[[torch.Tensor], None]] = None
 
     def destroy(self):
         for i, _ in enumerate(self.optimizer.param_groups):
@@ -1187,6 +1189,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
             # count = 0
             bucket = self.ipg_buckets[communication_data_type]
             for i, param_idx_in_group, param_id in bucket.params:
+                # 遍历所有当前bucket内的参数: i: 参数组id, param_idx_in_group: 参数在组内的索引, param_id: 参数的唯一id
                 param = self.bit16_groups[i][param_idx_in_group]
 
                 process_group = self.dp_process_group
@@ -1204,7 +1207,8 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                 for partition_id in partition_ids:
                     offset = self.grad_start_offset[i][partition_id][param_id]
                     partition_ids_w_offsets.append((partition_id, offset))
-                partition_ids_w_offsets.sort(key=lambda t: t[1])
+                partition_ids_w_offsets.sort(
+                    key=lambda t: t[1])  # partition_ids_w_offsets记录了当前参数的所有partition id及其offset
 
                 # Calculate rank and offsets for grad slices
                 for idx in range(len(partition_ids_w_offsets)):
@@ -1221,6 +1225,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                     else:
                         # Set numel to next partition's offset
                         numel = partition_ids_w_offsets[idx + 1][1] - offset
+                    # numel是参数长度
 
                     # Merge bucket ranges if they belong to the same rank
                     if partition_id == prev_id and process_group == prev_process_group:
@@ -1229,14 +1234,16 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                     else:
                         rank_and_offsets.append((partition_id, curr_size, numel))
                         real_dp_process_group.append(process_group)
+                    # rank_and_offsets按照group和分区划分，记录这分区id，起始位置，参数长度
                     curr_size += numel
                     prev_id, prev_process_group = partition_id, process_group
 
             tensor.div_(dist.get_world_size(group=self.dp_process_group) / float(self.sequence_parallel_size))
 
             buckets = {}
+            # dst是pid, bucket_offset是当前bucket下某个group和分区分区组的起始位置，numel是参数长度
             for i, (dst, bucket_offset, numel) in enumerate(rank_and_offsets):
-                grad_slice = tensor.narrow(0, int(bucket_offset), int(numel))
+                grad_slice = tensor.narrow(0, int(bucket_offset), int(numel))  # 获取同group和同分区对应的参数切片
                 bucket_key = real_dp_process_group[i] if self.use_multi_rank_bucket_allreduce else (
                     dst, real_dp_process_group[i])
                 if bucket_key not in buckets:
@@ -1479,6 +1486,10 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         #print(f"Grad norm after copy to contiguous_buffer {param.grad.data.norm()}")
         self.grads_in_partition_offset += param.numel()
 
+    def all_reduce_hook(self, tensor):
+        if self._all_reduce_hook:
+            self._all_reduce_hook(tensor)
+
     def reduce_ipg_grads(self):
         for comm_dtype in sort_dtypes(self.ipg_buckets.keys()):
             bucket = self.ipg_buckets[comm_dtype]
@@ -1498,11 +1509,14 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
                         else extra_large_grad_reduc_for_average.data.view_as(extra_large_grad_reduc.transpose(0, 1))
 
                     self.average_tensor(extra_large_grad_reduc_for_average, comm_dtype)
+                    self.all_reduce_hook(extra_large_grad_reduc_for_average)
                     del self.extra_large_param_to_reduce[comm_dtype]
                 else:
                     self.average_tensor(bucket.buffer[bucket.index].narrow(0, 0, bucket.elements), comm_dtype)
+                    self.all_reduce_hook(bucket.buffer[bucket.index].narrow(0, 0, bucket.elements))
             else:
                 self.buffered_reduce_fallback(None, bucket.grads, comm_dtype, elements_per_buffer=bucket.elements)
+                self.all_reduce_hook(bucket.grads)
 
         if self.overlap_comm:
             stream = self.reduction_stream
@@ -2343,7 +2357,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         # 对于fused adam, param_groups[0] keys: ['params', 'lr', 'bias_correction', 'betas', 'eps', 'weight_decay', 'step']
         #
         for i, group in enumerate(self.optimizer.param_groups):
-            p = group['params'][0]      # group['params']只有一个值，即当前分区的flattened tensor
+            p = group['params'][0]  # group['params']只有一个值，即当前分区的flattened tensor
             # self.optimizer.state[p]的值是一个字典，记录了step, exp_avg, exp_avg_sq等优化器参数，本例为FusedAdam。
             lean_optimizer_state = self._get_state_without_padding(self.optimizer.state[p], self.groups_padding[i])
             optimizer_groups_state.append(lean_optimizer_state)
@@ -2568,7 +2582,7 @@ class DeepSpeedZeroOptimizer(ZeROOptimizer):
         """
 
         # I think it should actually be ok to reload the optimizer before the model.
-        dp_rank = dist.get_rank(group=self.dp_process_group)        # dp_rank
+        dp_rank = dist.get_rank(group=self.dp_process_group)  # dp_rank
         current_rank_sd = state_dict_list[dp_rank]
         self._load_global_state(current_rank_sd)
 
